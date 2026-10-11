@@ -35,6 +35,7 @@ stages:
               backendAzureRmKey: $(backendKey)
               command: 'init'  # Initialize Terraform
               workingDirectory: 'terraform'  # Set the working directory
+              commandOptions: '-reconfigure -backend-config=use_azuread_auth=true'
 
           # Validate Terraform configuration
           - task: TerraformTaskV4@4
