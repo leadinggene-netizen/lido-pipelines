@@ -1,0 +1,178 @@
+# =============================================================================
+# Azure Synapse Data Platform Deployment Pipeline
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/synapse*.tf
+      - terraform/*.tfvars
+
+pool:
+  name: 'Default'
+
+variables:
+  - group: synapse-secrets  # Variable group containing synapse_sql_admin_password
+  - name: terraformVersion
+    value: '1.5.5'
+  - name: azureServiceConnection
+    value: 'azurerm'
+  - name: backendResourceGroup
+    value: 'tfstate-rg'
+  - name: backendStorageAccount
+    value: 'tfstatesynapse'
+  - name: backendContainer
+    value: 'tfstate'
+  - name: backendKey
+    value: 'synapse.terraform.tfstate'
+
+stages:
+  # ==========================================================================
+  # Stage 1: Validate & Plan
+  # ==========================================================================
+  - stage: Plan
+    displayName: 'Terraform Plan'
+    jobs:
+      - job: TerraformPlan
+        displayName: 'Init, Validate & Plan'
+        steps:
+          - task: TerraformInstaller@1
+            displayName: 'Install Terraform'
+            inputs:
+              terraformVersion: $(terraformVersion)
+
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Init'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: 'terraform'
+              backendServiceArm: $(azureServiceConnection)
+              backendAzureRmResourceGroupName: $(backendResourceGroup)
+              backendAzureRmStorageAccountName: $(backendStorageAccount)
+              backendAzureRmContainerName: $(backendContainer)
+              backendAzureRmKey: $(backendKey)
+
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Validate'
+            inputs:
+              provider: 'azurerm'
+              command: 'validate'
+              workingDirectory: 'terraform'
+
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Plan'
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: 'terraform'
+              environmentServiceNameAzureRM: $(azureServiceConnection)
+              commandOptions: '-var-file=dev.tfvars -var="synapse_sql_admin_password=$(synapse_sql_admin_password)" -out=tfplan'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Plan Artifact'
+            inputs:
+              targetPath: 'terraform'
+              artifactName: 'terraform-plan'
+
+  # ==========================================================================
+  # Stage 2: Manual Approval
+  # ==========================================================================
+  - stage: Approve
+    displayName: 'Approval Gate'
+    dependsOn: Plan
+    jobs:
+      - job: waitForValidation
+        displayName: 'Wait for Approval'
+        pool: server
+        timeoutInMinutes: 1440
+        steps:
+          - task: ManualValidation@0
+            inputs:
+              notifyUsers: 'support@leadinggene.com'
+              instructions: |
+                Review the Terraform plan output before deploying Synapse resources.
+
+                Resources to be created:
+                - Data Lake Storage Gen2 (bronze, silver, gold containers)
+                - Synapse Workspace
+                - Dedicated SQL Pool (DW100c)
+                - Spark Pool (3-10 nodes)
+                - Key Vault
+                - RBAC assignments
+              onTimeout: 'reject'
+
+  # ==========================================================================
+  # Stage 3: Apply Infrastructure
+  # ==========================================================================
+  - stage: Apply
+    displayName: 'Terraform Apply'
+    dependsOn: Approve
+    jobs:
+      - deployment: TerraformApply
+        displayName: 'Deploy Synapse Platform'
+        environment: 'synapse-dev'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download Plan'
+                  inputs:
+                    artifactName: 'terraform-plan'
+                    downloadPath: 'terraform'
+
+                - task: TerraformInstaller@1
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: $(terraformVersion)
+
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Init'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'init'
+                    workingDirectory: 'terraform'
+                    backendServiceArm: $(azureServiceConnection)
+                    backendAzureRmResourceGroupName: $(backendResourceGroup)
+                    backendAzureRmStorageAccountName: $(backendStorageAccount)
+                    backendAzureRmContainerName: $(backendContainer)
+                    backendAzureRmKey: $(backendKey)
+
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Apply'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'apply'
+                    workingDirectory: 'terraform'
+                    environmentServiceNameAzureRM: $(azureServiceConnection)
+                    commandOptions: 'tfplan'
+
+  # ==========================================================================
+  # Stage 4: Post-Deployment Validation
+  # ==========================================================================
+  - stage: Validate
+    displayName: 'Post-Deploy Validation'
+    dependsOn: Apply
+    jobs:
+      - job: ValidateDeployment
+        displayName: 'Validate Synapse Resources'
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Verify Synapse Workspace'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "=== Synapse Workspace Status ==="
+                az synapse workspace show --name devdata-synapse-ws --resource-group synapse-*-rg --query "provisioningState" -o tsv
+
+                echo "=== Data Lake Containers ==="
+                az storage container list --account-name devdatadatalake --auth-mode login --query "[].name" -o tsv
+
+                echo "=== Spark Pool Status ==="
+                az synapse spark pool show --workspace-name devdata-synapse-ws --name devdataspark --resource-group synapse-*-rg --query "provisioningState" -o tsv
