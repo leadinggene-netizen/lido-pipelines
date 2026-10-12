@@ -20,7 +20,7 @@ stages:
     jobs:
       - job: TerraformInit
         steps:
-          - task: TerraformInstaller@0  # Install Terraform
+          - task: TerraformInstaller@1  # Install Terraform
             inputs:
               terraformVersion: $(terraformVersion)
 
@@ -49,6 +49,8 @@ stages:
               command: 'plan'  # Run terraform plan
               environmentServiceNameAzureRM: $(azureServiceConnection)  # Azure service connection for authentication
               workingDirectory: 'terraform'  # Set the working directory
+            env:
+              ARM_RESOURCE_PROVIDER_REGISTRATIONS: 'none'
           - task: TerraformTaskV4@4
             inputs:
               provider: 'azurerm'
@@ -57,3 +59,5 @@ stages:
               commandOptions: '--auto-approve'
               environmentServiceNameAzureRM: $(azureServiceConnection)  # Azure service connection for authentication
               workingDirectory: 'terraform'  # Set the working directory
+            env:
+              ARM_RESOURCE_PROVIDER_REGISTRATIONS: 'none'
