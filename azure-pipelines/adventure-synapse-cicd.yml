@@ -28,7 +28,7 @@ variables:
   - name: synapseWorkspace
     value: 'rg2dsynapsews'
   - name: resourceGroup
-    value: 'rg2dapachepl'  # Update with your resource group
+    value: 'rg2-dataengineering-sandbox-useast'  # Update with your resource group
   - name: storageAccount
     value: 'rg2d'  # Your Data Lake storage account
 
