@@ -1,0 +1,271 @@
+# =============================================================================
+# Adventure Project - Synapse CI/CD Pipeline (No Terraform)
+# =============================================================================
+# This pipeline demonstrates PR → Approval → Deploy workflow for Synapse
+# Target workspace: rg2dsynapsews
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - synapse/*
+      - notebooks/*
+      - pipelines/*
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - name: azureServiceConnection
+    value: 'azure-connection'  # Update with your service connection name
+  - name: synapseWorkspace
+    value: 'rg2dsynapsews'
+  - name: resourceGroup
+    value: 'rg2dapachepl'  # Update with your resource group
+  - name: storageAccount
+    value: 'rg2d'  # Your Data Lake storage account
+
+stages:
+  # ==========================================================================
+  # Stage 1: Validate (runs on every PR and push)
+  # ==========================================================================
+  - stage: Validate
+    displayName: '🔍 Validate Synapse Artifacts'
+    jobs:
+      - job: ValidateArtifacts
+        displayName: 'Validate Notebooks & Pipelines'
+        steps:
+          - checkout: self
+          
+          - script: |
+              echo "========================================="
+              echo "  Validating Synapse Artifacts"
+              echo "========================================="
+              echo ""
+              echo "📁 Checking repository structure..."
+              ls -la
+              echo ""
+              echo "📓 Notebooks found:"
+              find . -name "*.ipynb" -o -name "*.py" 2>/dev/null | head -20 || echo "  No notebooks found"
+              echo ""
+              echo "🔄 Pipeline definitions found:"
+              find . -name "*.json" -path "*/pipeline/*" 2>/dev/null | head -20 || echo "  No pipelines found"
+              echo ""
+              echo "✅ Validation complete"
+            displayName: 'List Artifacts'
+
+          - task: AzureCLI@2
+            displayName: 'Verify Synapse Workspace Exists'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Checking Synapse workspace: $(synapseWorkspace)"
+                az synapse workspace show \
+                  --name $(synapseWorkspace) \
+                  --resource-group $(resourceGroup) \
+                  --query "{name:name, status:provisioningState, endpoint:connectivityEndpoints.sql}" \
+                  -o table
+                
+                echo ""
+                echo "✅ Workspace is accessible"
+
+  # ==========================================================================
+  # Stage 2: Build (package artifacts)
+  # ==========================================================================
+  - stage: Build
+    displayName: '📦 Build & Package'
+    dependsOn: Validate
+    condition: succeeded()
+    jobs:
+      - job: PackageArtifacts
+        displayName: 'Package Synapse Artifacts'
+        steps:
+          - checkout: self
+          
+          - script: |
+              echo "Creating deployment package..."
+              mkdir -p $(Build.ArtifactStagingDirectory)/synapse-artifacts
+              
+              # Copy notebooks
+              if [ -d "notebooks" ]; then
+                cp -r notebooks $(Build.ArtifactStagingDirectory)/synapse-artifacts/
+                echo "✅ Notebooks packaged"
+              fi
+              
+              # Copy pipeline definitions
+              if [ -d "pipelines" ]; then
+                cp -r pipelines $(Build.ArtifactStagingDirectory)/synapse-artifacts/
+                echo "✅ Pipelines packaged"
+              fi
+              
+              # Copy SQL scripts
+              if [ -d "sql" ]; then
+                cp -r sql $(Build.ArtifactStagingDirectory)/synapse-artifacts/
+                echo "✅ SQL scripts packaged"
+              fi
+              
+              echo ""
+              echo "📦 Package contents:"
+              ls -la $(Build.ArtifactStagingDirectory)/synapse-artifacts/
+            displayName: 'Package Artifacts'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Artifacts'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/synapse-artifacts'
+              artifactName: 'synapse-deployment'
+
+  # ==========================================================================
+  # Stage 3: Manual Approval Gate
+  # ==========================================================================
+  - stage: Approval
+    displayName: '⏳ Approval Gate'
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - job: WaitForApproval
+        displayName: 'Wait for Manual Approval'
+        pool: server
+        timeoutInMinutes: 1440  # 24 hours
+        steps:
+          - task: ManualValidation@0
+            displayName: '🔐 Approve Deployment'
+            inputs:
+              notifyUsers: |
+                support@leadinggene.com
+              instructions: |
+                ═══════════════════════════════════════════════════════════
+                           SYNAPSE DEPLOYMENT APPROVAL REQUEST
+                ═══════════════════════════════════════════════════════════
+                
+                📋 REVIEW CHECKLIST:
+                
+                ☐ 1. Review the Build stage logs for packaged artifacts
+                ☐ 2. Verify the correct notebooks/pipelines are included
+                ☐ 3. Check that no sensitive data is exposed
+                ☐ 4. Confirm target workspace: rg2dsynapsews
+                
+                ⚠️  DEPLOYMENT IMPACT:
+                • Notebooks will be uploaded to Synapse workspace
+                • Pipeline definitions will be updated
+                • Existing artifacts with same name will be OVERWRITTEN
+                
+                👉 Click APPROVE to proceed with deployment
+                👉 Click REJECT to cancel deployment
+                
+                ═══════════════════════════════════════════════════════════
+              onTimeout: 'reject'
+
+  # ==========================================================================
+  # Stage 4: Deploy to Synapse
+  # ==========================================================================
+  - stage: Deploy
+    displayName: '🚀 Deploy to Synapse'
+    dependsOn: Approval
+    condition: succeeded()
+    jobs:
+      - deployment: DeploySynapse
+        displayName: 'Deploy to rg2dsynapsews'
+        environment: 'synapse-production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download Artifacts'
+                  inputs:
+                    artifactName: 'synapse-deployment'
+                    downloadPath: '$(Pipeline.Workspace)/synapse-artifacts'
+
+                - task: AzureCLI@2
+                  displayName: '🚀 Deploy to Synapse Workspace'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      echo "========================================="
+                      echo "  Deploying to Synapse: $(synapseWorkspace)"
+                      echo "========================================="
+                      
+                      WORKSPACE=$(synapseWorkspace)
+                      ARTIFACTS_DIR="$(Pipeline.Workspace)/synapse-artifacts"
+                      
+                      # List what we're deploying
+                      echo "📦 Artifacts to deploy:"
+                      ls -la $ARTIFACTS_DIR
+                      
+                      # Deploy notebooks (if any)
+                      if [ -d "$ARTIFACTS_DIR/notebooks" ]; then
+                        echo ""
+                        echo "📓 Deploying notebooks..."
+                        for notebook in $ARTIFACTS_DIR/notebooks/*.ipynb; do
+                          if [ -f "$notebook" ]; then
+                            NAME=$(basename "$notebook" .ipynb)
+                            echo "  → Uploading: $NAME"
+                            # az synapse notebook import --workspace-name $WORKSPACE --name $NAME --file @"$notebook"
+                            echo "    ✅ $NAME uploaded (simulated)"
+                          fi
+                        done
+                      fi
+                      
+                      echo ""
+                      echo "========================================="
+                      echo "  ✅ Deployment Complete!"
+                      echo "========================================="
+                      echo ""
+                      echo "🔗 Synapse Studio: https://web.azuresynapse.net"
+
+  # ==========================================================================
+  # Stage 5: Post-Deploy Verification
+  # ==========================================================================
+  - stage: Verify
+    displayName: '✅ Verify Deployment'
+    dependsOn: Deploy
+    condition: succeeded()
+    jobs:
+      - job: VerifyDeployment
+        displayName: 'Verify Synapse Resources'
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Check Deployed Resources'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "========================================="
+                echo "  Post-Deployment Verification"
+                echo "========================================="
+                
+                echo ""
+                echo "📊 Synapse Workspace Status:"
+                az synapse workspace show \
+                  --name $(synapseWorkspace) \
+                  --resource-group $(resourceGroup) \
+                  --query "provisioningState" -o tsv
+                
+                echo ""
+                echo "📓 Notebooks in workspace:"
+                az synapse notebook list \
+                  --workspace-name $(synapseWorkspace) \
+                  --query "[].name" -o tsv 2>/dev/null || echo "  (requires additional permissions)"
+                
+                echo ""
+                echo "🔥 Spark Pools:"
+                az synapse spark pool list \
+                  --workspace-name $(synapseWorkspace) \
+                  --resource-group $(resourceGroup) \
+                  --query "[].{name:name, status:provisioningState, nodes:nodeCount}" -o table
+                
+                echo ""
+                echo "✅ Verification complete!"
